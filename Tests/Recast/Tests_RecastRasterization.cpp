@@ -559,7 +559,10 @@ TEST_CASE("rcRasterizeTriangle", "[recast][rasterization]")
 
 	SECTION("Degenerate triangles rasterize to nothing")
 	{
-		SKIP("Currently Recast rasterizes degenerate triangles as if they were a line or point of non-zero volume.");
+		// SKIP() requires exceptions, but this project is built with -fno-exceptions,
+		// so skip the rest of this section manually.
+		WARN("SKIP: Currently Recast rasterizes degenerate triangles as if they were a line or point of non-zero volume.");
+		return;
 		{ // Co-linear points
 			float v0[] = {1.0f, 0.0f, 0.5f};
 			float v1[] = {2.0f, 0.0f, 0.5f};
@@ -609,5 +612,174 @@ TEST_CASE("rcRasterizeTriangle", "[recast][rasterization]")
 				REQUIRE(hf.spans[x + z * hf.width] == nullptr);
 			}
 		}
+	}
+}
+
+TEST_CASE("rcRasterizeTriangles thin triangles", "[recast][rasterization]")
+{
+	rcContext ctx(false);
+
+	constexpr int xSize = 10;
+	constexpr int ySize = 20;
+	constexpr int zSize = 10;
+
+	constexpr float cellSize = 0.3f;
+	constexpr float cellHeight = 0.1f;
+
+	constexpr float minBounds[3] {0.0f, 0.0f, 0.0f};
+	constexpr float maxBounds[3] {cellSize * xSize, cellHeight * ySize, cellSize * zSize};
+
+	SECTION("Thin diagonal triangle does not lose slivers at cell corners")
+	{
+		rcHeightfield hf;
+		REQUIRE(rcCreateHeightfield(&ctx, hf, xSize, zSize, minBounds, maxBounds, cellSize, cellHeight));
+
+		// Regression test: this ~0.19m wide diagonal triangle (thinner than the 0.3m
+		// cell size) crosses cell (3, 2) only through a thin sliver at the cell
+		// corner.  At cell resolution the sliver is lost to floating point rounding
+		// at the cell boundary, punching a hole in the diagonal chain of spans.
+		float verts[] = {
+			1.19607139f, 0.955861211f, 1.01206851f,
+			1.20293546f, 1.0749774f, 0.816263437f,
+			2.31036806f, 1.05162787f, 0.953107834f,
+		};
+		int tris[] = {0, 1, 2};
+		unsigned char areas[] = {RC_WALKABLE_AREA};
+		REQUIRE(rcRasterizeTriangles(&ctx, verts, 3, tris, areas, 1, hf, 1));
+
+		// The triangle should produce spans in exactly these cells, with no holes
+		// along the diagonal.
+		constexpr bool expected[zSize][xSize] = {
+			{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // z = 0
+			{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // z = 1
+			{0, 0, 0, 1, 1, 1, 1, 0, 0, 0}, // z = 2, includes the previously missed cell (3, 2)
+			{0, 0, 0, 1, 1, 1, 1, 1, 0, 0}, // z = 3
+			{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // z = 4
+			{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // z = 5
+			{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // z = 6
+			{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // z = 7
+			{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // z = 8
+			{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, // z = 9
+		};
+
+		for (int z = 0; z < zSize; z++)
+		{
+			for (int x = 0; x < xSize; x++)
+			{
+				const rcSpan* toplevelSpan = hf.spans[x + z * hf.width];
+				REQUIRE((toplevelSpan != nullptr) == (expected[z][x] != 0));
+			}
+		}
+
+		// The previously missed cell has a span with the expected vertical range.
+		const rcSpan* span = hf.spans[3 + 2 * hf.width];
+		REQUIRE(span != nullptr);
+		REQUIRE(span->smin == 10);
+		REQUIRE(span->smax == 11);
+		REQUIRE(span->area == RC_WALKABLE_AREA);
+		REQUIRE(span->next == nullptr);
+	}
+
+	SECTION("Thin diagonal plank rasterizes to a continuous chain of spans")
+	{
+		rcHeightfield hf;
+		REQUIRE(rcCreateHeightfield(&ctx, hf, xSize, zSize, minBounds, maxBounds, cellSize, cellHeight));
+
+		// A 0.15m wide diagonal plank (half the cell size), like a narrow bridge or
+		// ramp placed by a level designer.  Two triangles forming a quad from
+		// (0.3, 0.3) to (2.7, 2.7).
+		constexpr float halfWidth = 0.075f;
+		constexpr float perpX = -0.70710678f * halfWidth;
+		constexpr float perpZ = 0.70710678f * halfWidth;
+		float verts[] = {
+			0.3f + perpX, 0.55f, 0.3f + perpZ,
+			0.3f - perpX, 0.55f, 0.3f - perpZ,
+			2.7f - perpX, 0.55f, 2.7f - perpZ,
+			2.7f + perpX, 0.55f, 2.7f + perpZ,
+		};
+		int tris[] = {0, 1, 2, 0, 2, 3};
+		unsigned char areas[] = {RC_WALKABLE_AREA, RC_WALKABLE_AREA};
+		REQUIRE(rcRasterizeTriangles(&ctx, verts, 4, tris, areas, 2, hf, 1));
+
+		// Every cell the plank's centerline passes through must have a walkable
+		// span - the plank must not have any holes.
+		for (float t = 0.0f; t <= 1.0f; t += 0.005f)
+		{
+			const float p = 0.3f + 2.4f * t;
+			const int x = (int)(p / cellSize);
+			const int z = (int)(p / cellSize);
+			const rcSpan* span = hf.spans[x + z * hf.width];
+			REQUIRE(span != nullptr);
+			REQUIRE(span->area == RC_WALKABLE_AREA);
+		}
+	}
+
+	SECTION("Wide triangles are not affected by thin triangle rasterization")
+	{
+		// Rasterize a wide platform, then add a thin diagonal plank away from it.
+		// The platform's spans must be identical before and after.
+		float platformVerts[] = {
+			0.0f, 0.5f, 0.0f,
+			0.9f, 0.5f, 0.0f,
+			0.9f, 0.5f, 0.9f,
+			0.0f, 0.5f, 0.9f,
+		};
+		int platformTris[] = {0, 1, 2, 0, 2, 3};
+		unsigned char platformAreas[] = {RC_WALKABLE_AREA, RC_WALKABLE_AREA};
+
+		constexpr float halfWidth = 0.075f;
+		constexpr float perpX = -0.70710678f * halfWidth;
+		constexpr float perpZ = 0.70710678f * halfWidth;
+		float plankVerts[] = {
+			1.5f + perpX, 0.55f, 1.5f + perpZ,
+			1.5f - perpX, 0.55f, 1.5f - perpZ,
+			2.7f - perpX, 0.55f, 2.7f - perpZ,
+			2.7f + perpX, 0.55f, 2.7f + perpZ,
+		};
+		int plankTris[] = {0, 1, 2, 0, 2, 3};
+		unsigned char plankAreas[] = {RC_WALKABLE_AREA, RC_WALKABLE_AREA};
+
+		rcHeightfield hfPlatformOnly;
+		REQUIRE(rcCreateHeightfield(&ctx, hfPlatformOnly, xSize, zSize, minBounds, maxBounds, cellSize, cellHeight));
+		REQUIRE(rcRasterizeTriangles(&ctx, platformVerts, 4, platformTris, platformAreas, 2, hfPlatformOnly, 1));
+
+		rcHeightfield hfCombined;
+		REQUIRE(rcCreateHeightfield(&ctx, hfCombined, xSize, zSize, minBounds, maxBounds, cellSize, cellHeight));
+		REQUIRE(rcRasterizeTriangles(&ctx, platformVerts, 4, platformTris, platformAreas, 2, hfCombined, 1));
+		REQUIRE(rcRasterizeTriangles(&ctx, plankVerts, 4, plankTris, plankAreas, 2, hfCombined, 1));
+
+		int platformSpanCount = 0;
+		int combinedSpanCount = 0;
+		for (int z = 0; z < zSize; z++)
+		{
+			for (int x = 0; x < xSize; x++)
+			{
+				// The platform's spans are unchanged by the addition of the plank.
+				const rcSpan* spanA = hfPlatformOnly.spans[x + z * hfPlatformOnly.width];
+				const rcSpan* spanB = hfCombined.spans[x + z * hfCombined.width];
+				if (x < 3 && z < 3)
+				{
+					REQUIRE(spanA != nullptr);
+					REQUIRE(spanB != nullptr);
+					REQUIRE(spanA->smin == spanB->smin);
+					REQUIRE(spanA->smax == spanB->smax);
+					REQUIRE(spanA->area == spanB->area);
+					REQUIRE((spanA->next == nullptr) == (spanB->next == nullptr));
+				}
+				for (const rcSpan* s = spanA; s; s = s->next)
+				{
+					platformSpanCount++;
+				}
+				for (const rcSpan* s = spanB; s; s = s->next)
+				{
+					combinedSpanCount++;
+				}
+			}
+		}
+
+		// The platform rasterizes to exactly one span in each of its 9 cells, and
+		// the plank only adds spans on top of that.
+		REQUIRE(platformSpanCount == 9);
+		REQUIRE(combinedSpanCount > platformSpanCount);
 	}
 }

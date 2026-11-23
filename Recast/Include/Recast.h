@@ -922,6 +922,10 @@ bool rcAddSpan(rcContext* context, rcHeightfield& heightfield,
 /// Calling this for each triangle in a mesh is less efficient than calling rcRasterizeTriangles
 ///
 /// No spans will be added if the triangle does not overlap the heightfield grid.
+
+/// Triangles thinner than a cell are rasterized at sub-cell resolution so that thin
+/// walkable surfaces (e.g. narrow planks) are not missed.
+///
 ///
 /// @see rcHeightfield
 /// @ingroup recast
@@ -941,6 +945,10 @@ bool rcRasterizeTriangle(rcContext* context,
 /// Rasterizes an indexed triangle mesh into the specified heightfield.
 ///
 /// Spans will only be added for triangles that overlap the heightfield grid.
+
+/// Triangles thinner than a cell are rasterized at sub-cell resolution so that thin
+/// walkable surfaces (e.g. narrow planks) are not missed.
+///
 /// 
 /// @see rcHeightfield
 /// @ingroup recast
@@ -962,6 +970,10 @@ bool rcRasterizeTriangles(rcContext* context,
 /// Rasterizes an indexed triangle mesh into the specified heightfield.
 ///
 /// Spans will only be added for triangles that overlap the heightfield grid.
+
+/// Triangles thinner than a cell are rasterized at sub-cell resolution so that thin
+/// walkable surfaces (e.g. narrow planks) are not missed.
+///
 /// 
 /// @see rcHeightfield
 /// @ingroup recast
@@ -985,6 +997,10 @@ bool rcRasterizeTriangles(rcContext* context,
 /// Expects each triangle to be specified as three sequential vertices of 3 floats.
 ///
 /// Spans will only be added for triangles that overlap the heightfield grid.
+
+/// Triangles thinner than a cell are rasterized at sub-cell resolution so that thin
+/// walkable surfaces (e.g. narrow planks) are not missed.
+///
 /// 
 /// @see rcHeightfield
 /// @ingroup recast

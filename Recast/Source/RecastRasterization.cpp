@@ -17,6 +17,7 @@
 //
 
 #include <math.h>
+#include <string.h>
 #include "Recast.h"
 #include "RecastAlloc.h"
 #include "RecastAssert.h"
@@ -218,6 +219,12 @@ enum rcAxis
 	RC_AXIS_Z = 2
 };
 
+/// The number of sub-cells along each axis used when rasterizing triangles that are
+/// thinner than a cell.  Thin triangles are clipped against a
+/// RC_SUB_CELL_RESOLUTION x RC_SUB_CELL_RESOLUTION grid within each cell they touch
+/// so that slivers narrower than a cell are not lost.
+static const int RC_SUB_CELL_RESOLUTION = 4;
+
 /// Divides a convex polygon of max 12 vertices into two convex polygons
 /// across a separating axis.
 /// 
@@ -294,6 +301,230 @@ static void dividePoly(const float* inVerts, int inVertsCount,
 	*outVerts2Count = poly2Vert;
 }
 
+/// Clips a convex polygon of max 7 vertices against an axis-aligned plane in double precision,
+/// keeping only the part on one side of the plane.
+///
+/// @param[in]	inVerts			The input polygon vertices
+/// @param[in]	inVertsCount	The number of input polygon vertices
+/// @param[out]	outVerts		The clipped polygon's vertices
+/// @param[in]	axis			The axis of the separating plane
+/// @param[in]	axisOffset		The offset of the separating plane along the axis
+/// @param[in]	keepBelow		True to keep the part below the plane, false to keep the part above it
+/// @returns The number of vertices in the clipped polygon
+static int clipPolyPlaneD(const double* inVerts, const int inVertsCount, double* outVerts,
+                          const int axis, const double axisOffset, const bool keepBelow)
+{
+	rcAssert(inVertsCount <= 7);
+
+	// How far towards the kept side of the separating plane each vertex is.
+	double inVertAxisDelta[7];
+	for (int inVert = 0; inVert < inVertsCount; ++inVert)
+	{
+		const double offset = inVerts[inVert * 3 + axis];
+		inVertAxisDelta[inVert] = keepBelow ? axisOffset - offset : offset - axisOffset;
+	}
+
+	int outVert = 0;
+	for (int inVertA = 0, inVertB = inVertsCount - 1; inVertA < inVertsCount; inVertB = inVertA, ++inVertA)
+	{
+		const bool inA = inVertAxisDelta[inVertA] >= 0.0;
+		const bool inB = inVertAxisDelta[inVertB] >= 0.0;
+
+		if (inA != inB)
+		{
+			const double s = inVertAxisDelta[inVertB] / (inVertAxisDelta[inVertB] - inVertAxisDelta[inVertA]);
+			outVerts[outVert * 3 + 0] = inVerts[inVertB * 3 + 0] + (inVerts[inVertA * 3 + 0] - inVerts[inVertB * 3 + 0]) * s;
+			outVerts[outVert * 3 + 1] = inVerts[inVertB * 3 + 1] + (inVerts[inVertA * 3 + 1] - inVerts[inVertB * 3 + 1]) * s;
+			outVerts[outVert * 3 + 2] = inVerts[inVertB * 3 + 2] + (inVerts[inVertA * 3 + 2] - inVerts[inVertB * 3 + 2]) * s;
+			outVert++;
+			if (inVertAxisDelta[inVertA] > 0.0)
+			{
+				outVerts[outVert * 3 + 0] = inVerts[inVertA * 3 + 0];
+				outVerts[outVert * 3 + 1] = inVerts[inVertA * 3 + 1];
+				outVerts[outVert * 3 + 2] = inVerts[inVertA * 3 + 2];
+				outVert++;
+			}
+		}
+		else if (inA)
+		{
+			outVerts[outVert * 3 + 0] = inVerts[inVertA * 3 + 0];
+			outVerts[outVert * 3 + 1] = inVerts[inVertA * 3 + 1];
+			outVerts[outVert * 3 + 2] = inVerts[inVertA * 3 + 2];
+			outVert++;
+		}
+	}
+
+	return outVert;
+}
+
+/// Clips a triangle against an axis-aligned square in the XZ plane in double precision.
+///
+/// @param[in]	triVerts	The triangle's vertices (9 doubles)
+/// @param[in]	minX		The square's minimum x extent
+/// @param[in]	minZ		The square's minimum z extent
+/// @param[in]	maxX		The square's maximum x extent
+/// @param[in]	maxZ		The square's maximum z extent
+/// @param[out]	outVerts	The clipped polygon's vertices (up to 7 vertices, 21 doubles)
+/// @returns The number of vertices in the clipped polygon.  Less than 3 means no overlap.
+static int clipTriangleToSquareD(const double* triVerts,
+                                 const double minX, const double minZ,
+                                 const double maxX, const double maxZ,
+                                 double* outVerts)
+{
+	double buf[7 * 3];
+	memcpy(outVerts, triVerts, 9 * sizeof(double));
+
+	int nv = clipPolyPlaneD(outVerts, 3, buf, RC_AXIS_X, minX, false);
+	if (nv < 3)
+	{
+		return nv;
+	}
+	nv = clipPolyPlaneD(buf, nv, outVerts, RC_AXIS_X, maxX, true);
+	if (nv < 3)
+	{
+		return nv;
+	}
+	nv = clipPolyPlaneD(outVerts, nv, buf, RC_AXIS_Z, minZ, false);
+	if (nv < 3)
+	{
+		return nv;
+	}
+	nv = clipPolyPlaneD(buf, nv, outVerts, RC_AXIS_Z, maxZ, true);
+	return nv;
+}
+
+///	Rasterize a single triangle that is thinner than a cell to the heightfield.
+///
+/// Thin triangles are clipped against a sub-cell resolution grid within each cell they
+/// touch, in double precision, so that slivers of the triangle that are narrower than a
+/// cell are not lost to floating point rounding at cell boundaries.  Only the cells
+/// overlapped by the triangle's bounds are visited, so the extra cost is limited to the
+/// thin triangle's footprint.
+///
+/// @param[in] 	v0					Triangle vertex 0
+/// @param[in] 	v1					Triangle vertex 1
+/// @param[in] 	v2					Triangle vertex 2
+/// @param[in] 	areaID				The area ID to assign to the rasterized spans
+/// @param[in] 	heightfield			Heightfield to rasterize into
+/// @param[in] 	heightfieldBBMin	The min extents of the heightfield bounding box
+/// @param[in] 	heightfieldBBMax	The max extents of the heightfield bounding box
+/// @param[in] 	cellSize			The x and z axis size of a voxel in the heightfield
+/// @param[in] 	inverseCellHeight	1 / cellHeight
+/// @param[in] 	flagMergeThreshold	The threshold in which area flags will be merged
+/// @returns true if the operation completes successfully.  false if there was an error adding spans to the heightfield.
+static bool rasterizeTriSubCell(const float* v0, const float* v1, const float* v2,
+                                const unsigned char areaID, rcHeightfield& heightfield,
+                                const float* heightfieldBBMin, const float* heightfieldBBMax,
+                                const float cellSize, const float inverseCellHeight,
+                                const int flagMergeThreshold)
+{
+	// Work in double precision relative to the heightfield origin so that slivers of the
+	// triangle much thinner than a cell are represented accurately.
+	const float* triVerts[3] = {v0, v1, v2};
+	double tri[9];
+	double triBBMin[3] = {1e300, 1e300, 1e300};
+	double triBBMax[3] = {-1e300, -1e300, -1e300};
+	for (int vert = 0; vert < 3; ++vert)
+	{
+		for (int axis = 0; axis < 3; ++axis)
+		{
+			const double offset = (double)triVerts[vert][axis] - (double)heightfieldBBMin[axis];
+			tri[vert * 3 + axis] = offset;
+			triBBMin[axis] = triBBMin[axis] < offset ? triBBMin[axis] : offset;
+			triBBMax[axis] = triBBMax[axis] > offset ? triBBMax[axis] : offset;
+		}
+	}
+
+	const int w = heightfield.width;
+	const int h = heightfield.height;
+	const double by = (double)heightfieldBBMax[1] - (double)heightfieldBBMin[1];
+	const double inverseCellSizeD = 1.0 / (double)cellSize;
+	const double inverseCellHeightD = (double)inverseCellHeight;
+
+	// The range of cells overlapped by the triangle's bounds, clamped to the heightfield.
+	// Each cell is clipped independently, so no cells outside the heightfield are needed.
+	const int x0 = rcClamp((int)(triBBMin[0] * inverseCellSizeD), 0, w - 1);
+	const int x1 = rcClamp((int)(triBBMax[0] * inverseCellSizeD), 0, w - 1);
+	const int z0 = rcClamp((int)(triBBMin[2] * inverseCellSizeD), 0, h - 1);
+	const int z1 = rcClamp((int)(triBBMax[2] * inverseCellSizeD), 0, h - 1);
+
+	const double subCellSize = (double)cellSize / (double)RC_SUB_CELL_RESOLUTION;
+
+	for (int z = z0; z <= z1; ++z)
+	{
+		const double cellMinZ = (double)z * (double)cellSize;
+		for (int x = x0; x <= x1; ++x)
+		{
+			const double cellMinX = (double)x * (double)cellSize;
+
+			// Test each sub-cell of the cell.  The cell is covered if the triangle
+			// overlaps any of its sub-cells, and the span's vertical range is the
+			// union of the covered sub-cell slivers' vertical ranges.
+			bool covered = false;
+			double spanMin = 1e300;
+			double spanMax = -1e300;
+			for (int subZ = 0; subZ < RC_SUB_CELL_RESOLUTION; ++subZ)
+			{
+				const double subMinZ = cellMinZ + (double)subZ * subCellSize;
+				for (int subX = 0; subX < RC_SUB_CELL_RESOLUTION; ++subX)
+				{
+					const double subMinX = cellMinX + (double)subX * subCellSize;
+					double poly[7 * 3];
+					const int nv = clipTriangleToSquareD(tri, subMinX, subMinZ,
+					                                     subMinX + subCellSize, subMinZ + subCellSize,
+					                                     poly);
+					if (nv < 3)
+					{
+						continue;
+					}
+					covered = true;
+					for (int vert = 0; vert < nv; ++vert)
+					{
+						spanMin = spanMin < poly[vert * 3 + 1] ? spanMin : poly[vert * 3 + 1];
+						spanMax = spanMax > poly[vert * 3 + 1] ? spanMax : poly[vert * 3 + 1];
+					}
+				}
+			}
+
+			if (!covered)
+			{
+				continue;
+			}
+
+			// Skip the span if it's completely outside the heightfield bounding box
+			if (spanMax < 0.0)
+			{
+				continue;
+			}
+			if (spanMin > by)
+			{
+				continue;
+			}
+
+			// Clamp the span to the heightfield bounding box.
+			if (spanMin < 0.0)
+			{
+				spanMin = 0.0;
+			}
+			if (spanMax > by)
+			{
+				spanMax = by;
+			}
+
+			// Snap the span to the heightfield height grid.
+			const unsigned short spanMinCellIndex = (unsigned short)rcClamp((int)floor(spanMin * inverseCellHeightD), 0, RC_SPAN_MAX_HEIGHT);
+			const unsigned short spanMaxCellIndex = (unsigned short)rcClamp((int)ceil(spanMax * inverseCellHeightD), (int)spanMinCellIndex + 1, RC_SPAN_MAX_HEIGHT);
+
+			if (!addSpan(heightfield, x, z, spanMinCellIndex, spanMaxCellIndex, areaID, flagMergeThreshold))
+			{
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
 ///	Rasterize a single triangle to the heightfield.
 ///
 ///	This code is extremely hot, so much care should be given to maintaining maximum perf here.
@@ -331,6 +562,36 @@ static bool rasterizeTri(const float* v0, const float* v1, const float* v2,
 	if (!overlapBounds(triBBMin, triBBMax, heightfieldBBMin, heightfieldBBMax))
 	{
 		return true;
+	}
+
+	// If the triangle is thinner than a cell in the XZ plane, rasterize it at sub-cell
+	// resolution instead.  The cell-resolution clipping below can drop slivers of a thin
+	// triangle that are narrower than float rounding at a cell boundary, punching holes
+	// in thin walkable surfaces (e.g. narrow diagonal planks).
+	{
+		const double e1x = (double)v1[0] - (double)v0[0];
+		const double e1z = (double)v1[2] - (double)v0[2];
+		const double e2x = (double)v2[0] - (double)v0[0];
+		const double e2z = (double)v2[2] - (double)v0[2];
+		const double e3x = (double)v2[0] - (double)v1[0];
+		const double e3z = (double)v2[2] - (double)v1[2];
+
+		// Twice the triangle's XZ area.
+		const double doubleArea = fabs(e1x * e2z - e1z * e2x);
+		if (doubleArea > 0.0)
+		{
+			const double edgeLen2 = rcMax(rcMax(e1x * e1x + e1z * e1z, e2x * e2x + e2z * e2z), e3x * e3x + e3z * e3z);
+			const double cellSize2 = (double)cellSize * (double)cellSize;
+
+			// The triangle's minimum width (doubleArea / longestEdge) is smaller than
+			// a cell.  Comparing squared values to avoid a square root.
+			if (doubleArea * doubleArea < cellSize2 * edgeLen2)
+			{
+				return rasterizeTriSubCell(v0, v1, v2, areaID, heightfield,
+				                           heightfieldBBMin, heightfieldBBMax,
+				                           cellSize, inverseCellHeight, flagMergeThreshold);
+			}
+		}
 	}
 
 	const int w = heightfield.width;
