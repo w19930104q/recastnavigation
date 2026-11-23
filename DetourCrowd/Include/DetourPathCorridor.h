@@ -31,7 +31,11 @@ class dtPathCorridor
 	dtPolyRef* m_path;
 	int m_npath;
 	int m_maxPath;
-	
+
+	/// The dtNavMesh::getTileRemovalVersion() value seen by the last isValid() check.
+	/// Used to detect tiles that were permanently removed beyond the look-ahead.
+	unsigned int m_tileRemovalVersion;
+
 public:
 	dtPathCorridor();
 	~dtPathCorridor();
@@ -81,10 +85,18 @@ public:
 	bool trimInvalidPath(dtPolyRef safeRef, const float* safePos,
 						 dtNavMeshQuery* navquery, const dtQueryFilter* filter);
 	
-	/// Checks the current corridor path to see if its polygon references remain valid. 
+	/// Checks the current corridor path to see if its polygon references remain valid.
+	///
+	/// The look-ahead polygons are checked against the query filter as usual. In
+	/// addition, if tiles have been permanently removed from the navigation mesh
+	/// since the last check (see dtNavMesh::getTileRemovalVersion()), the whole
+	/// path is validated once, so that removed tiles beyond the look-ahead are
+	/// detected as well. Polygons whose tile is only swapped out temporarily
+	/// (see dtNavMesh::swapOutTile()) keep the corridor valid: their references
+	/// become valid again when the tile is reloaded.
 	///  @param[in]		maxLookAhead	The number of polygons from the beginning of the corridor to search.
 	///  @param[in]		navquery		The query object used to build the corridor.
-	///  @param[in]		filter			The filter to apply to the operation.	
+	///  @param[in]		filter			The filter to apply to the operation.
 	bool isValid(const int maxLookAhead, dtNavMeshQuery* navquery, const dtQueryFilter* filter);
 	
 	/// Moves the position from the current location to the desired location, adjusting the corridor 

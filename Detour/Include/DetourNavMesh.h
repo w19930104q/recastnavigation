@@ -367,11 +367,51 @@ public:
 	dtStatus addTile(unsigned char* data, int dataSize, int flags, dtTileRef lastRef, dtTileRef* result);
 	
 	/// Removes the specified tile from the navigation mesh.
+	///
+	/// The removal is considered permanent: all polygon references of the tile
+	/// become invalid and #getTileRemovalVersion is incremented. If the tile is
+	/// only being unloaded temporarily (e.g. streamed out to a cache) and will
+	/// be added back later, use #swapOutTile instead.
 	///  @param[in]		ref			The reference of the tile to remove.
 	///  @param[out]	data		Data associated with deleted tile.
 	///  @param[out]	dataSize	Size of the data associated with deleted tile.
 	/// @return The status flags for the operation.
 	dtStatus removeTile(dtTileRef ref, unsigned char** data, int* dataSize);
+
+	/// Removes the specified tile from the navigation mesh with the intent of
+	/// adding it back later. (E.g. when temporarily streaming a region out of memory.)
+	///
+	/// The tile's data is returned just like with #removeTile, but the tile is
+	/// remembered as "swapped out": while swapped out, #isValidPolyRef returns
+	/// false for the tile's polygon references and #isSwappedOutPolyRef returns
+	/// true. Add the tile back with #addTile, passing the tile's reference
+	/// (obtained before swapping it out) as @p lastRef, and all of its polygon
+	/// references become valid again, unchanged.
+	///
+	/// Swapping a tile out does not increment #getTileRemovalVersion, so path
+	/// corridors crossing the tile are not invalidated. If the tile will not be
+	/// reloaded after all, call #freeSwappedOutTile to discard it permanently.
+	///
+	/// @note The tile's slot is not reserved while swapped out. If all tile slots
+	/// are in use when the tile is reloaded, or the slot has been reused by another
+	/// tile, #addTile will fail to restore the reference. Keep enough headroom in
+	/// dtNavMeshParams::maxTiles to guarantee reloadability.
+	///  @param[in]		ref			The reference of the tile to swap out.
+	///  @param[out]	data		Data associated with the swapped out tile.
+	///  @param[out]	dataSize	Size of the data associated with the swapped out tile.
+	/// @return The status flags for the operation.
+	/// @see #removeTile, #freeSwappedOutTile, #isSwappedOutPolyRef
+	dtStatus swapOutTile(dtTileRef ref, unsigned char** data, int* dataSize);
+
+	/// Permanently discards a tile previously removed with #swapOutTile.
+	///
+	/// The tile's polygon references become permanently invalid and
+	/// #getTileRemovalVersion is incremented, so structures tracking the navmesh
+	/// (e.g. dtPathCorridor) can detect the removal. The tile's data (returned by
+	/// #swapOutTile) remains owned by the caller.
+	///  @param[in]		ref		The reference the tile had when it was swapped out.
+	/// @return The status flags for the operation.
+	dtStatus freeSwappedOutTile(dtTileRef ref);
 
 	/// @}
 
@@ -444,6 +484,27 @@ public:
 	///  @param[in]	ref		The polygon reference to check.
 	/// @return True if polygon reference is valid for the navigation mesh.
 	bool isValidPolyRef(dtPolyRef ref) const;
+
+	/// Checks whether the polygon reference belongs to a tile that is currently
+	/// swapped out. (Temporarily removed via #swapOutTile, pending reload.)
+	///
+	/// Swapped out polygon references are not valid (#isValidPolyRef returns
+	/// false), but they are not dead either: they become valid again, unchanged,
+	/// once the tile is added back with #addTile.
+	///  @param[in]	ref		The polygon reference to check.
+	/// @return True if the polygon reference belongs to a swapped out tile.
+	bool isSwappedOutPolyRef(dtPolyRef ref) const;
+
+	/// A version number that is incremented every time polygon references are
+	/// permanently invalidated, i.e. when a tile is removed via #removeTile or a
+	/// swapped out tile is discarded via #freeSwappedOutTile. (Temporarily
+	/// swapping a tile out via #swapOutTile does not increment the version.)
+	///
+	/// Tracking this value allows structures that cache polygon references
+	/// (e.g. dtPathCorridor) to cheaply detect that references beyond their
+	/// regular look-ahead may have been invalidated.
+	/// @return The current tile removal version.
+	unsigned int getTileRemovalVersion() const { return m_tileRemovalVersion; }
 	
 	/// Gets the polygon reference for the tile's base polygon.
 	///  @param[in]	tile		The tile.
@@ -638,6 +699,16 @@ private:
 	
 	/// Removes external links at specified side.
 	void unconnectLinks(dtMeshTile* tile, dtMeshTile* target);
+
+	/// Shared implementation of #removeTile and #swapOutTile. Does not touch
+	/// the swapped out tile registry or the tile removal version.
+	dtStatus removeTileInternal(dtTileRef ref, unsigned char** data, int* dataSize);
+
+	/// Returns the index of the tile reference in the swapped out tile registry, or -1.
+	int findSwappedOutTile(dtTileRef ref) const;
+
+	/// Removes the registry entry at the specified index.
+	void removeSwappedOutTileAt(int index);
 	
 
 	// TODO: These methods are duplicates from dtNavMeshQuery, but are needed for off-mesh connection finding.
@@ -663,7 +734,12 @@ private:
 	dtMeshTile** m_posLookup;			///< Tile hash lookup.
 	dtMeshTile* m_nextFree;				///< Freelist of tiles.
 	dtMeshTile* m_tiles;				///< List of tiles.
-		
+
+	dtTileRef* m_swappedOutTiles;		///< Tile references that are currently swapped out, pending reload.
+	int m_swappedOutTileCount;			///< Number of entries in m_swappedOutTiles.
+	int m_swappedOutTileCapacity;		///< Capacity of m_swappedOutTiles.
+	unsigned int m_tileRemovalVersion;	///< Incremented when polygon references are permanently invalidated.
+	
 #ifndef DT_POLYREF64
 	unsigned int m_saltBits;			///< Number of salt bits in the tile ID.
 	unsigned int m_tileBits;			///< Number of tile bits in the tile ID.

@@ -200,7 +200,8 @@ may be needed.  E.g. If you move the target, check #getLastPoly() to see if it i
 dtPathCorridor::dtPathCorridor() :
 	m_path(0),
 	m_npath(0),
-	m_maxPath(0)
+	m_maxPath(0),
+	m_tileRemovalVersion(0)
 {
 }
 
@@ -581,15 +582,53 @@ bool dtPathCorridor::trimInvalidPath(dtPolyRef safeRef, const float* safePos,
 
 /// @par
 ///
-/// The path can be invalidated if there are structural changes to the underlying navigation mesh, or the state of 
+/// The path can be invalidated if there are structural changes to the underlying navigation mesh, or the state of
 /// a polygon within the path changes resulting in it being filtered out. (E.g. An exclusion or inclusion flag changes.)
+///
+/// The look-ahead polygons are checked every call. Polygons further along the
+/// path are only re-validated when the navigation mesh reports that tiles have
+/// been permanently removed since the previous check (see
+/// dtNavMesh::getTileRemovalVersion()), which keeps the amortized cost of this
+/// function proportional to @p maxLookAhead instead of the full path length.
+///
+/// A polygon whose tile has been temporarily swapped out (see
+/// dtNavMesh::swapOutTile()) does not invalidate the corridor: its polygon
+/// reference becomes valid again, unchanged, when the tile is reloaded. Only
+/// permanently removed tiles (dtNavMesh::removeTile(),
+/// dtNavMesh::freeSwappedOutTile()) invalidate the corridor.
 bool dtPathCorridor::isValid(const int maxLookAhead, dtNavMeshQuery* navquery, const dtQueryFilter* filter)
 {
-	// Check that all polygons still pass query filter.
+	const dtNavMesh* nav = navquery->getAttachedNavMesh();
+
+	// If tiles have been permanently removed since the last check, polygons
+	// beyond the look-ahead may be gone as well. Validate the whole path once.
+	// (Swapped out tiles do not bump the removal version, so temporarily
+	// unloaded tiles never trigger this scan.)
+	const unsigned int removalVersion = nav->getTileRemovalVersion();
+	if (removalVersion != m_tileRemovalVersion)
+	{
+		for (int i = 0; i < m_npath; ++i)
+		{
+			const dtPolyRef ref = m_path[i];
+			// Keep m_tileRemovalVersion stale on failure so that subsequent
+			// calls re-check the whole path instead of only the look-ahead.
+			if (!nav->isValidPolyRef(ref) && !nav->isSwappedOutPolyRef(ref))
+				return false;
+		}
+		m_tileRemovalVersion = removalVersion;
+	}
+
+	// Check that all polygons in the look-ahead window still pass the query filter.
 	const int n = dtMin(m_npath, maxLookAhead);
 	for (int i = 0; i < n; ++i)
 	{
-		if (!navquery->isValidPolyRef(m_path[i], filter))
+		const dtPolyRef ref = m_path[i];
+		// The polygon's tile is temporarily swapped out. Its reference remains
+		// reserved and becomes valid again when the tile is reloaded, so there
+		// is no need to replan.
+		if (nav->isSwappedOutPolyRef(ref))
+			continue;
+		if (!navquery->isValidPolyRef(ref, filter))
 			return false;
 	}
 

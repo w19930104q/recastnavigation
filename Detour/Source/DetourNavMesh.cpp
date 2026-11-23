@@ -193,7 +193,11 @@ dtNavMesh::dtNavMesh() :
 	m_tileLutMask(0),
 	m_posLookup(0),
 	m_nextFree(0),
-	m_tiles(0)
+	m_tiles(0),
+	m_swappedOutTiles(0),
+	m_swappedOutTileCount(0),
+	m_swappedOutTileCapacity(0),
+	m_tileRemovalVersion(0)
 {
 #ifndef DT_POLYREF64
 	m_saltBits = 0;
@@ -219,6 +223,7 @@ dtNavMesh::~dtNavMesh()
 	}
 	dtFree(m_posLookup);
 	dtFree(m_tiles);
+	dtFree(m_swappedOutTiles);
 }
 		
 dtStatus dtNavMesh::init(const dtNavMeshParams* params)
@@ -249,7 +254,10 @@ dtStatus dtNavMesh::init(const dtNavMeshParams* params)
 		m_tiles[i].next = m_nextFree;
 		m_nextFree = &m_tiles[i];
 	}
-	
+
+	// All previously swapped out tiles are gone for good after a re-init.
+	m_swappedOutTileCount = 0;
+
 	// Init ID generator values.
 #ifndef DT_POLYREF64
 	m_tileBits = dtIlog2(dtNextPow2((unsigned int)params->maxTiles));
@@ -1054,9 +1062,30 @@ dtStatus dtNavMesh::addTile(unsigned char* data, int dataSize, int flags,
 		}
 	}
 	
+	// The slot may have been registered as swapped out. The registration is
+	// dropped either way: if this is the swapped out tile being reloaded
+	// (same reference), its polygon references are valid once more; if the
+	// slot was reused by a different tile, the swapped out references are
+	// dead for good, which counts as a permanent removal.
+	const dtTileRef newTileRef = getTileRef(tile);
+	const unsigned int newTileIndex = (unsigned int)(tile - m_tiles);
+	for (int i = 0; i < m_swappedOutTileCount; )
+	{
+		if (decodePolyIdTile((dtPolyRef)m_swappedOutTiles[i]) == newTileIndex)
+		{
+			if (m_swappedOutTiles[i] != newTileRef)
+				m_tileRemovalVersion++;
+			removeSwappedOutTileAt(i);
+		}
+		else
+		{
+			++i;
+		}
+	}
+
 	if (result)
 		*result = getTileRef(tile);
-	
+
 	return DT_SUCCESS;
 }
 
@@ -1245,6 +1274,18 @@ bool dtNavMesh::isValidPolyRef(dtPolyRef ref) const
 /// @see #addTile
 dtStatus dtNavMesh::removeTile(dtTileRef ref, unsigned char** data, int* dataSize)
 {
+	dtStatus status = removeTileInternal(ref, data, dataSize);
+	if (dtStatusFailed(status))
+		return status;
+
+	// The tile's polygon references are permanently invalidated.
+	m_tileRemovalVersion++;
+
+	return DT_SUCCESS;
+}
+
+dtStatus dtNavMesh::removeTileInternal(dtTileRef ref, unsigned char** data, int* dataSize)
+{
 	if (!ref)
 		return DT_FAILURE | DT_INVALID_PARAM;
 	unsigned int tileIndex = decodePolyIdTile((dtPolyRef)ref);
@@ -1336,6 +1377,109 @@ dtStatus dtNavMesh::removeTile(dtTileRef ref, unsigned char** data, int* dataSiz
 	m_nextFree = tile;
 
 	return DT_SUCCESS;
+}
+
+int dtNavMesh::findSwappedOutTile(dtTileRef ref) const
+{
+	for (int i = 0; i < m_swappedOutTileCount; ++i)
+	{
+		if (m_swappedOutTiles[i] == ref)
+			return i;
+	}
+	return -1;
+}
+
+void dtNavMesh::removeSwappedOutTileAt(int index)
+{
+	m_swappedOutTiles[index] = m_swappedOutTiles[m_swappedOutTileCount-1];
+	m_swappedOutTileCount--;
+}
+
+/// @par
+///
+/// Use getTileRef() to obtain the tile's reference before swapping it out, and
+/// pass that reference as @c lastRef to #addTile when loading the tile back in.
+/// This restores the exact same polygon references the tile had before.
+///
+/// @see #removeTile, #freeSwappedOutTile, #isSwappedOutPolyRef
+dtStatus dtNavMesh::swapOutTile(dtTileRef ref, unsigned char** data, int* dataSize)
+{
+	if (!ref)
+		return DT_FAILURE | DT_INVALID_PARAM;
+
+	// Normalize to a tile reference (drop any polygon bits).
+	const unsigned int salt = decodePolyIdSalt((dtPolyRef)ref);
+	const unsigned int tileIndex = decodePolyIdTile((dtPolyRef)ref);
+	if ((int)tileIndex >= m_maxTiles)
+		return DT_FAILURE | DT_INVALID_PARAM;
+	const dtMeshTile* tile = &m_tiles[tileIndex];
+	if (tile->salt != salt || !tile->header)
+		return DT_FAILURE | DT_INVALID_PARAM;
+	const dtTileRef tileRef = (dtTileRef)encodePolyId(salt, tileIndex, 0);
+
+	// Make room in the registry before removing the tile, so that an
+	// allocation failure cannot leave the tile removed but unregistered.
+	if (m_swappedOutTileCount == m_swappedOutTileCapacity)
+	{
+		const int newCapacity = m_swappedOutTileCapacity ? m_swappedOutTileCapacity*2 : 8;
+		dtTileRef* newTiles = (dtTileRef*)dtAlloc(sizeof(dtTileRef)*newCapacity, DT_ALLOC_PERM);
+		if (!newTiles)
+			return DT_FAILURE | DT_OUT_OF_MEMORY;
+		if (m_swappedOutTiles)
+		{
+			memcpy(newTiles, m_swappedOutTiles, sizeof(dtTileRef)*m_swappedOutTileCount);
+			dtFree(m_swappedOutTiles);
+		}
+		m_swappedOutTiles = newTiles;
+		m_swappedOutTileCapacity = newCapacity;
+	}
+
+	// Remove the tile like removeTile() does. The slot's salt is bumped, so
+	// the tile's old polygon references cannot collide with references of
+	// other tiles while swapped out.
+	dtStatus status = removeTileInternal(tileRef, data, dataSize);
+	if (dtStatusFailed(status))
+		return status;
+
+	// Remember the reference so that queries can tell "temporarily swapped
+	// out" apart from "permanently removed". The tile removal version is
+	// deliberately left unchanged: the references become valid again once
+	// the tile is reloaded.
+	m_swappedOutTiles[m_swappedOutTileCount++] = tileRef;
+
+	return DT_SUCCESS;
+}
+
+/// @par
+///
+/// The tile's data was handed out by #swapOutTile and remains owned by the
+/// caller; this function only discards the navmesh's record of the tile.
+dtStatus dtNavMesh::freeSwappedOutTile(dtTileRef ref)
+{
+	if (!ref)
+		return DT_FAILURE | DT_INVALID_PARAM;
+
+	const dtTileRef tileRef = (dtTileRef)encodePolyId(decodePolyIdSalt((dtPolyRef)ref),
+													  decodePolyIdTile((dtPolyRef)ref), 0);
+	const int index = findSwappedOutTile(tileRef);
+	if (index < 0)
+		return DT_FAILURE | DT_INVALID_PARAM;
+
+	removeSwappedOutTileAt(index);
+
+	// The tile's polygon references will never become valid again.
+	m_tileRemovalVersion++;
+
+	return DT_SUCCESS;
+}
+
+bool dtNavMesh::isSwappedOutPolyRef(dtPolyRef ref) const
+{
+	if (!ref)
+		return false;
+	const dtTileRef tileRef = (dtTileRef)encodePolyId(decodePolyIdSalt(ref),
+													  decodePolyIdTile(ref), 0);
+	return findSwappedOutTile(tileRef) >= 0;
 }
 
 dtTileRef dtNavMesh::getTileRef(const dtMeshTile* tile) const
