@@ -1415,7 +1415,57 @@ void dtCrowd::update(const float dt, dtCrowdAgentDebugInfo* debug)
 		dtCrowdAgentAnimation* anim = &m_agentAnims[idx];
 		if (!anim->active)
 			continue;
-		
+
+		// The polygons at either end of the off-mesh connection may have become
+		// invalid while the agent is traversing the link (e.g. the target tile
+		// was unloaded or rebuilt by a tile cache). Since checkPathValidity()
+		// only handles walking agents, the validity of the connection must be
+		// verified here, otherwise the agent would remain stuck in the off-mesh
+		// state or end up outside of the navmesh.
+		const dtQueryFilter* filter = &m_filters[ag->params.queryFilterType];
+		if (!m_navquery->isValidPolyRef(anim->polyRef, filter) ||
+			!m_navquery->isValidPolyRef(ag->corridor.getFirstPoly(), filter))
+		{
+			// Cancel the traversal and fall back to walking so that the path
+			// can be replanned.
+			anim->active = false;
+
+			// Try to place the agent back on the navmesh. Prefer the current
+			// position, then the position where the traversal started (which
+			// was on the navmesh when the connection was entered).
+			dtPolyRef ref = 0;
+			float nearest[3];
+			m_navquery->findNearestPoly(ag->npos, m_agentPlacementHalfExtents, filter, &ref, nearest);
+			if (!ref)
+				m_navquery->findNearestPoly(anim->initPos, m_agentPlacementHalfExtents, filter, &ref, nearest);
+
+			if (ref)
+			{
+				dtVcopy(ag->npos, nearest);
+				ag->corridor.reset(ref, nearest);
+				ag->boundary.reset();
+				ag->partial = false;
+				ag->state = DT_CROWDAGENT_STATE_WALKING;
+
+				// Replan towards the target. If the target itself has become
+				// invalid, checkPathValidity() will recover or fail it during
+				// the next update.
+				if (ag->targetState != DT_CROWDAGENT_TARGET_NONE &&
+					ag->targetState != DT_CROWDAGENT_TARGET_VELOCITY)
+				{
+					requestMoveTargetReplan(idx, ag->targetRef, ag->targetPos);
+				}
+			}
+			else
+			{
+				// Could not find a valid location on the navmesh, set state to invalid.
+				ag->corridor.reset(0, ag->npos);
+				ag->partial = false;
+				ag->boundary.reset();
+				ag->state = DT_CROWDAGENT_STATE_INVALID;
+			}
+			continue;
+		}
 
 		anim->t += dt;
 		if (anim->t > anim->tmax)
