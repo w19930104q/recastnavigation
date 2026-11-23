@@ -800,6 +800,133 @@ static void mergeRegionHoles(rcContext* ctx, rcContourRegion& region)
 
 /// @par
 ///
+/// Welding only affects the simplified vertices of contours that come close to a tile
+/// border plane.  Vertices on the plane are shared between adjacent tiles after welding,
+/// so the tiles' portal edges match up when the tiles are connected in Detour.
+///
+/// See the #rcConfig documentation for more information on the configuration parameters.
+///
+/// @see rcBuildContoursEx, rcContourSet, rcConfig
+bool rcWeldContourBorderVertices(rcContext* ctx, rcContourSet& cset, const float weldThreshold)
+{
+	rcAssert(ctx);
+
+	// Only tiled builds have tile borders to weld to.  Contour sets built
+	// without a border (single tile builds) are left untouched.
+	if (cset.borderSize <= 0 || weldThreshold <= 0.0f)
+		return true;
+	if (cset.cs <= 0.0f)
+	{
+		ctx->log(RC_LOG_ERROR, "rcWeldContourBorderVertices: Invalid cell size %f.", cset.cs);
+		return false;
+	}
+
+	const int w = cset.width;
+	const int h = cset.height;
+
+	// The maximum distance (in voxels) a border vertex may deviate from a tile
+	// border plane and still be welded onto it.
+	const float weldDist = weldThreshold / cset.cs;
+	// The spacing (in voxels) of the canonical lattice that the vertex
+	// coordinate along the border is quantized to.  Adjacent tiles share the
+	// same lattice as long as the tile width and height (in voxels) are
+	// multiples of the quantum.
+	const int quantum = rcMax(1, (int)(weldThreshold / cset.cs));
+
+	// Reused buffer holding the original vertices of the contour currently
+	// being welded, so the contour can be restored if welding degenerates it.
+	rcTempVector<int> origVerts;
+
+	for (int i = 0; i < cset.nconts; ++i)
+	{
+		rcContour& cont = cset.conts[i];
+
+		// Only contours with vertices close to a tile border plane can be affected.
+		bool hasBorderVertex = false;
+		for (int j = 0; j < cont.nverts; ++j)
+		{
+			const int* v = &cont.verts[j*4];
+			if (fabsf((float)v[0]) <= weldDist || fabsf((float)(v[0] - w)) <= weldDist ||
+				fabsf((float)v[2]) <= weldDist || fabsf((float)(v[2] - h)) <= weldDist)
+			{
+				hasBorderVertex = true;
+				break;
+			}
+		}
+		if (!hasBorderVertex)
+			continue;
+
+		if (origVerts.capacity() < (rcSizeType)(cont.nverts*4) && !origVerts.reserve(cont.nverts*4))
+		{
+			ctx->log(RC_LOG_ERROR, "rcWeldContourBorderVertices: Out of memory 'origVerts' (%d).", cont.nverts*4);
+			return false;
+		}
+		origVerts.resize(cont.nverts*4);
+		memcpy(&origVerts[0], cont.verts, sizeof(int)*cont.nverts*4);
+
+		for (int j = 0; j < cont.nverts; ++j)
+		{
+			int* v = &cont.verts[j*4];
+
+			// Snap the vertex onto the tile border plane(s) it is close to.
+			bool onXPlane = false;
+			bool onZPlane = false;
+			if (fabsf((float)v[0]) <= weldDist) { v[0] = 0; onXPlane = true; }
+			else if (fabsf((float)(v[0] - w)) <= weldDist) { v[0] = w; onXPlane = true; }
+			if (fabsf((float)v[2]) <= weldDist) { v[2] = 0; onZPlane = true; }
+			else if (fabsf((float)(v[2] - h)) <= weldDist) { v[2] = h; onZPlane = true; }
+
+			// Quantize the coordinate along the border to the canonical
+			// lattice so that the adjacent tile generates the shared vertex
+			// at the exact same position.  Corner vertices (on two planes)
+			// are already fully determined by the planes.
+			if (onXPlane && !onZPlane)
+				v[2] = rcClamp(((v[2] + quantum/2) / quantum) * quantum, 0, h);
+			else if (onZPlane && !onXPlane)
+				v[0] = rcClamp(((v[0] + quantum/2) / quantum) * quantum, 0, w);
+		}
+
+		// Remove vertices that were welded onto their neighbor.
+		int n = 0;
+		for (int j = 0; j < cont.nverts; ++j)
+		{
+			const int* v = &cont.verts[j*4];
+			if (n > 0)
+			{
+				const int* pv = &cont.verts[(n-1)*4];
+				if (pv[0] == v[0] && pv[2] == v[2])
+					continue;
+			}
+			if (n != j)
+				memcpy(&cont.verts[n*4], v, sizeof(int)*4);
+			++n;
+		}
+		// The contour is a loop, the first and last vertices are neighbors too.
+		if (n > 1)
+		{
+			const int* first = &cont.verts[0];
+			const int* last = &cont.verts[(n-1)*4];
+			if (first[0] == last[0] && first[2] == last[2])
+				--n;
+		}
+
+		if (n >= 3)
+		{
+			cont.nverts = n;
+		}
+		else
+		{
+			// Welding would have degenerated the contour, keep the original.
+			memcpy(cont.verts, &origVerts[0], sizeof(int)*cont.nverts*4);
+			ctx->log(RC_LOG_WARNING, "rcWeldContourBorderVertices: Welding degenerated contour %d, contour left unchanged.", i);
+		}
+	}
+
+	return true;
+}
+
+/// @par
+///
 /// The raw contours will match the region outlines exactly. The @p maxError and @p maxEdgeLen
 /// parameters control how closely the simplified contours will match the raw contours.
 ///
@@ -811,9 +938,10 @@ static void mergeRegionHoles(rcContext* ctx, rcContourRegion& region)
 /// See the #rcConfig documentation for more information on the configuration parameters.
 ///
 /// @see rcAllocContourSet, rcCompactHeightfield, rcContourSet, rcConfig
-bool rcBuildContours(rcContext* ctx, const rcCompactHeightfield& chf,
-					 const float maxError, const int maxEdgeLen,
-					 rcContourSet& cset, const int buildFlags)
+bool rcBuildContoursEx(rcContext* ctx, const rcCompactHeightfield& chf,
+					   const float maxError, const int maxEdgeLen,
+					   rcContourSet& cset, const int buildFlags,
+					   const float borderWeldThreshold)
 {
 	rcAssert(ctx);
 	
@@ -1088,8 +1216,23 @@ bool rcBuildContours(rcContext* ctx, const rcCompactHeightfield& chf,
 				}
 			}
 		}
-		
+
 	}
-	
+
+	// Weld tile border vertices onto the shared tile border lattice if requested.
+	if ((buildFlags & RC_CONTOUR_WELD_BORDER_VERTICES) != 0 && borderWeldThreshold > 0.0f)
+	{
+		if (!rcWeldContourBorderVertices(ctx, cset, borderWeldThreshold))
+			return false;
+	}
+
 	return true;
+}
+
+bool rcBuildContours(rcContext* ctx, const rcCompactHeightfield& chf,
+					 const float maxError, const int maxEdgeLen,
+					 rcContourSet& cset, const int buildFlags)
+{
+	// A weld threshold of zero disables welding, so this behaves exactly as before.
+	return rcBuildContoursEx(ctx, chf, maxError, maxEdgeLen, cset, buildFlags, 0.0f);
 }

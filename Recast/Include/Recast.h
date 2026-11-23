@@ -615,7 +615,10 @@ static const int RC_AREA_BORDER = 0x20000;
 enum rcBuildContoursFlags
 {
 	RC_CONTOUR_TESS_WALL_EDGES = 0x01,	///< Tessellate solid (impassable) edges during contour simplification.
-	RC_CONTOUR_TESS_AREA_EDGES = 0x02	///< Tessellate edges between areas during contour simplification.
+	RC_CONTOUR_TESS_AREA_EDGES = 0x02,	///< Tessellate edges between areas during contour simplification.
+	RC_CONTOUR_WELD_BORDER_VERTICES = 0x04	///< Weld contour vertices close to a tile border onto the
+										///< shared tile border lattice so that adjacent tiles generate
+										///  matching border vertices. (See: #rcBuildContoursEx)
 };
 
 /// Applied to the region id field of contour vertices in order to extract the region id.
@@ -1309,6 +1312,65 @@ bool rcBuildHeightfieldLayers(rcContext* ctx, const rcCompactHeightfield& chf,
 bool rcBuildContours(rcContext* ctx, const rcCompactHeightfield& chf,
 					 float maxError, int maxEdgeLen,
 					 rcContourSet& cset, int buildFlags = RC_CONTOUR_TESS_WALL_EDGES);
+
+/// Builds a contour set from the region outlines in the provided compact heightfield,
+/// with optional welding of tile border vertices.
+///
+/// This is an extended version of #rcBuildContours.  When @p buildFlags contains
+/// #RC_CONTOUR_WELD_BORDER_VERTICES and the source heightfield was built with a
+/// border (i.e. a tiled build), contour vertices that lie within
+/// @p borderWeldThreshold of a tile border plane are snapped exactly onto
+/// that plane, and their coordinate along the border is quantized to a canonical
+/// lattice.  Since the lattice only depends on the tile grid, adjacent tiles generate
+/// shared border vertices at identical positions, which lets Detour reliably connect
+/// the tiles' portal edges.  Interior vertices (further from the tile borders than
+/// the threshold) are never modified.
+///
+/// @ingroup recast
+/// @param[in,out]	ctx					The build context to use during the operation.
+/// @param[in]		chf					A fully built compact heightfield.
+/// @param[in]		maxError			The maximum distance a simplified contour's border edges should deviate
+/// 									the original raw contour. [Limit: >=0] [Units: wu]
+/// @param[in]		maxEdgeLen			The maximum allowed length for contour edges along the border of the mesh.
+/// 									[Limit: >=0] [Units: vx]
+/// @param[out]		cset				The resulting contour set. (Must be pre-allocated.)
+/// @param[in]		buildFlags			The build flags. (See: #rcBuildContoursFlags)
+/// @param[in]		borderWeldThreshold	The maximum distance a tile border vertex may deviate from the
+/// 									tile border plane and still be welded onto it.  The threshold is
+/// 									tied to the cell size: a value of 1.5 * cell size welds vertices
+/// 									deviating up to one voxel, and the along-border lattice quantum is
+/// 									floor(threshold / cell size) voxels (minimum one).  For exact
+/// 									vertex sharing between adjacent tiles, the tile width and height
+/// 									(in voxels) should be multiples of the quantum.  A value of zero
+/// 									disables welding.  [Limit: >= 0] [Units: wu]
+/// @returns True if the operation completed successfully.
+/// @see rcBuildContours, rcWeldContourBorderVertices
+bool rcBuildContoursEx(rcContext* ctx, const rcCompactHeightfield& chf,
+					   float maxError, int maxEdgeLen,
+					   rcContourSet& cset, int buildFlags,
+					   float borderWeldThreshold);
+
+/// Welds the tile border vertices of a contour set onto the canonical tile border lattice.
+///
+/// Contour vertices that lie within @p weldThreshold of a tile border plane are snapped
+/// exactly onto that plane, and their coordinate along the border is quantized to a
+/// canonical lattice derived from the cell size.  This makes adjacent tiles of a tiled
+/// build generate shared border vertices at identical positions so that Detour can
+/// connect the tiles' portal edges.  Only the simplified vertices (#rcContour::verts)
+/// are modified; the raw vertices (#rcContour::rverts) and all interior vertices
+/// (further from the tile borders than the threshold) are left untouched.  Contour
+/// sets without a border (single tile builds) are never modified.
+///
+/// @ingroup recast
+/// @param[in,out]	ctx				The build context to use during the operation.
+/// @param[in,out]	cset			The contour set to weld.  Must have been built with a border.
+/// @param[in]		weldThreshold	The maximum distance a tile border vertex may deviate from the
+/// 								tile border plane and still be welded onto it.  Tied to the cell
+/// 								size: a value of 1.5 * cell size welds vertices deviating up to
+/// 								one voxel.  [Limit: >= 0] [Units: wu]
+/// @returns True if the operation completed successfully.
+/// @see rcBuildContoursEx
+bool rcWeldContourBorderVertices(rcContext* ctx, rcContourSet& cset, float weldThreshold);
 
 /// Builds a polygon mesh from the provided contours.
 /// @ingroup recast

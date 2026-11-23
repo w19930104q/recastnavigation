@@ -21,6 +21,7 @@ target_sources(Tests PRIVATE
 	DetourCrowd/Tests_DetourPathCorridor.cpp
 	Recast/Tests_Alloc.cpp
 	Recast/Tests_Recast.cpp
+	Recast/Tests_RecastContourWeld.cpp
 	Recast/Tests_RecastFilter.cpp
 	Recast/Tests_RecastRasterization.cpp
 )

@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <h2>[Unreleased](https://github.com/recastnavigation/recastnavigation/compare/1.6.0...HEAD)</h2>
+
+### Added
+- `rcBuildContoursEx` and `rcWeldContourBorderVertices` with the `RC_CONTOUR_WELD_BORDER_VERTICES` build flag: optionally weld contour vertices near a tile border onto the shared tile border lattice so adjacent tiles of a tiled build generate matching border vertices and Detour can reliably connect their portal edges. The existing `rcBuildContours` entry point is unchanged.
 <h2>[1.6.0](https://github.com/recastnavigation/recastnavigation/compare/1.5.1...1.6.0) - 2023-05-21</h2>
 
 ### Added
