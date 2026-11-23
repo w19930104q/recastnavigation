@@ -94,6 +94,30 @@ struct dtObstacleAvoidanceParams
 	unsigned char adaptiveDepth;	///< adaptive
 };
 
+/// Default per-query sample budget used by radius-aware adaptive sampling.
+static const int DT_DEFAULT_AVOIDANCE_SAMPLE_BUDGET = 256;
+
+/// Derives adaptive sampling resolution (divs/rings/depth) from the agent radius and
+/// the number of obstacles in the query, bounded by a total sample budget.
+///
+/// The mapping is deliberately sub-linear so that CPU cost stays bounded:
+///  - Angular divs scale with 1/sqrt(radius): small agents get finer angular
+///    resolution to thread narrow gaps, large agents get coarser steps.
+///  - Speed rings scale with sqrt(radius): large agents get wider speed-range
+///    coverage instead of angular density.
+///  - The sample budget scales with sqrt(obstacleCount) (clamped), and whatever
+///    budget remains after divs/rings are chosen becomes the refinement depth.
+///
+/// @param[in]	agentRadius		Radius of the agent.
+/// @param[in]	obstacleCount	Number of obstacles currently in the query (circles + segments).
+/// @param[in]	sampleBudget	Soft cap on total samples per query (divs*rings+1)*depth.
+/// @param[out]	outDivs			Angular divisions for the adaptive pattern.
+/// @param[out]	outRings		Speed rings for the adaptive pattern.
+/// @param[out]	outDepth		Refinement depth for the adaptive pattern.
+void dtCalcAdaptiveSamplingResolution(const float agentRadius, const int obstacleCount,
+									  const int sampleBudget,
+									  int& outDivs, int& outRings, int& outDepth);
+
 class dtObstacleAvoidanceQuery
 {
 public:
@@ -118,7 +142,22 @@ public:
 							   const float* vel, const float* dvel, float* nvel,
 							   const dtObstacleAvoidanceParams* params, 
 							   dtObstacleAvoidanceDebugData* debug = 0);
-	
+
+	/// Adaptive velocity sampling with a sampling pattern derived from the agent
+	/// radius and the current obstacle count (see dtCalcAdaptiveSamplingResolution).
+	///
+	/// Small agents get denser angular sampling so they can find safe velocities
+	/// through narrow gaps; large agents get wider speed-range coverage. The total
+	/// sample count is bounded by @p sampleBudget to keep per-frame CPU cost in check.
+	///
+	/// The @p params weights/horizTime are honored as usual; only the sampling
+	/// resolution (divs/rings/depth) is derived instead of taken from the params.
+	int sampleVelocityAdaptiveRadiusAware(const float* pos, const float rad, const float vmax,
+										  const float* vel, const float* dvel, float* nvel,
+										  const dtObstacleAvoidanceParams* params,
+										  const int sampleBudget = DT_DEFAULT_AVOIDANCE_SAMPLE_BUDGET,
+										  dtObstacleAvoidanceDebugData* debug = 0);
+
 	inline int getObstacleCircleCount() const { return m_ncircles; }
 	const dtObstacleCircle* getObstacleCircle(const int i) { return &m_circles[i]; }
 
@@ -131,6 +170,12 @@ private:
 	dtObstacleAvoidanceQuery& operator=(const dtObstacleAvoidanceQuery&);
 
 	void prepare(const float* pos, const float* dvel);
+
+	int sampleVelocityAdaptiveImpl(const float* pos, const float rad, const float vmax,
+								   const float* vel, const float* dvel, float* nvel,
+								   const dtObstacleAvoidanceParams* params,
+								   const int ndivs, const int nrings, const int depth,
+								   dtObstacleAvoidanceDebugData* debug);
 
 	float processSample(const float* vcand, const float cs,
 						const float* pos, const float rad,

@@ -493,6 +493,43 @@ inline void dtNormalize2D(float* v)
 	v[2] *= d;
 }
 
+void dtCalcAdaptiveSamplingResolution(const float agentRadius, const int obstacleCount,
+									  const int sampleBudget,
+									  int& outDivs, int& outRings, int& outDepth)
+{
+	// Radius at which the base resolution applies (roughly a human-sized agent).
+	static const float REF_RADIUS = 0.5f;
+	static const float MIN_RADIUS = 0.05f;
+	static const int BASE_DIVS = 9;
+	static const int BASE_RINGS = 2;
+	static const int MIN_DIVS = 4;
+	static const int MAX_DEPTH = 8;
+	static const int MIN_BUDGET = 16;
+
+	const float rad = dtMax(agentRadius, MIN_RADIUS);
+
+	// Scene complexity scales the budget: sparse scenes don't need many samples,
+	// dense scenes get up to 2x. The sqrt keeps the scaling bounded.
+	const float complexity = dtMathSqrtf(dtClamp((float)obstacleCount / 8.0f, 0.25f, 4.0f));
+	const int budget = (int)(dtMax(sampleBudget, MIN_BUDGET) * complexity);
+
+	// Angular resolution scales with 1/sqrt(radius): small agents get finer angular
+	// steps so they can resolve narrow gaps, large agents get coarser steps.
+	// The sqrt makes the scaling sub-linear so tiny agents don't explode the
+	// sample count (linear 1/radius scaling would not fit a frame budget).
+	const float divScale = dtMathSqrtf(REF_RADIUS / rad);
+	outDivs = dtClamp((int)(BASE_DIVS * divScale + 0.5f), MIN_DIVS, DT_MAX_PATTERN_DIVS);
+
+	// Large agents instead get more speed rings, i.e. wider speed-range coverage.
+	const float ringScale = dtMathSqrtf(rad / REF_RADIUS);
+	outRings = dtClamp((int)(BASE_RINGS * ringScale + 0.5f), 1, DT_MAX_PATTERN_RINGS);
+
+	// Whatever budget remains after divs/rings are chosen becomes refinement depth.
+	// The budget is a soft cap: a single pass of the minimal pattern is always allowed.
+	const int perPass = outDivs * outRings + 1;
+	outDepth = dtClamp(budget / perPass, 1, MAX_DEPTH);
+}
+
 // vector normalization that ignores the y-component.
 inline void dtRorate2D(float* dest, const float* v, float ang)
 {
@@ -509,15 +546,39 @@ int dtObstacleAvoidanceQuery::sampleVelocityAdaptive(const float* pos, const flo
 													 const dtObstacleAvoidanceParams* params,
 													 dtObstacleAvoidanceDebugData* debug)
 {
+	return sampleVelocityAdaptiveImpl(pos, rad, vmax, vel, dvel, nvel, params,
+									  (int)params->adaptiveDivs, (int)params->adaptiveRings,
+									  (int)params->adaptiveDepth, debug);
+}
+
+int dtObstacleAvoidanceQuery::sampleVelocityAdaptiveRadiusAware(const float* pos, const float rad, const float vmax,
+																const float* vel, const float* dvel, float* nvel,
+																const dtObstacleAvoidanceParams* params,
+																const int sampleBudget,
+																dtObstacleAvoidanceDebugData* debug)
+{
+	int ndivs = 0, nrings = 0, ndepth = 0;
+	dtCalcAdaptiveSamplingResolution(rad, m_ncircles + m_nsegments, sampleBudget,
+									 ndivs, nrings, ndepth);
+	return sampleVelocityAdaptiveImpl(pos, rad, vmax, vel, dvel, nvel, params,
+									  ndivs, nrings, ndepth, debug);
+}
+
+int dtObstacleAvoidanceQuery::sampleVelocityAdaptiveImpl(const float* pos, const float rad, const float vmax,
+														 const float* vel, const float* dvel, float* nvel,
+														 const dtObstacleAvoidanceParams* params,
+														 const int ndivs, const int nrings, const int depth,
+														 dtObstacleAvoidanceDebugData* debug)
+{
 	prepare(pos, dvel);
-	
+
 	memcpy(&m_params, params, sizeof(dtObstacleAvoidanceParams));
 	m_invHorizTime = 1.0f / m_params.horizTime;
 	m_vmax = vmax;
 	m_invVmax = vmax > 0 ? 1.0f / vmax : FLT_MAX;
-	
+
 	dtVset(nvel, 0,0,0);
-	
+
 	if (debug)
 		debug->reset();
 
@@ -525,10 +586,6 @@ int dtObstacleAvoidanceQuery::sampleVelocityAdaptive(const float* pos, const flo
 	float pat[(DT_MAX_PATTERN_DIVS*DT_MAX_PATTERN_RINGS+1)*2];
 	int npat = 0;
 
-	const int ndivs = (int)m_params.adaptiveDivs;
-	const int nrings= (int)m_params.adaptiveRings;
-	const int depth = (int)m_params.adaptiveDepth;
-	
 	const int nd = dtClamp(ndivs, 1, DT_MAX_PATTERN_DIVS);
 	const int nr = dtClamp(nrings, 1, DT_MAX_PATTERN_RINGS);
 	const float da = (1.0f/nd) * DT_PI*2;
