@@ -169,6 +169,14 @@ struct dtCrowdAgent
 	dtPathQueueRef targetPathqRef;		///< Path finder ref.
 	bool targetReplan;					///< Flag indicating that the current path is being replanned.
 	float targetReplanTime;				/// <Time since the agent's target was replanned.
+
+	/// The custom query filter used by this agent when #hasCustomFilter is true.
+	/// When used, it overrides the shared filter referenced by #dtCrowdAgentParams::queryFilterType,
+	/// allowing e.g. per-agent area costs and include/exclude flags.
+	dtQueryFilter filter;
+
+	/// True if the agent uses its own #filter instead of one of the crowd's shared filters.
+	bool hasCustomFilter;
 };
 
 struct dtCrowdAgentAnimation
@@ -233,6 +241,13 @@ class dtCrowd
 
 	inline int getAgentIndex(const dtCrowdAgent* agent) const  { return (int)(agent - m_agents); }
 
+	/// Gets the filter in effect for the specified agent: the agent's custom filter if it has one,
+	/// otherwise the shared filter referenced by #dtCrowdAgentParams::queryFilterType.
+	inline const dtQueryFilter* getAgentFilter(const dtCrowdAgent* agent) const
+	{
+		return agent->hasCustomFilter ? &agent->filter : &m_filters[agent->params.queryFilterType];
+	}
+
 	bool requestMoveTargetReplan(const int idx, dtPolyRef ref, const float* pos);
 
 	void purge();
@@ -278,6 +293,29 @@ public:
 	///  @param[in]		params	The configuration of the agent.
 	/// @return The index of the agent in the agent pool. Or -1 if the agent could not be added.
 	int addAgent(const float* pos, const dtCrowdAgentParams* params);
+
+	/// Adds a new agent to the crowd, with a custom query filter used for all of the agent's
+	/// pathfinding instead of the shared filter referenced by #dtCrowdAgentParams::queryFilterType.
+	///  @param[in]		pos		The requested position of the agent. [(x, y, z)]
+	///  @param[in]		params	The configuration of the agent.
+	///  @param[in]		filter	The custom query filter for the agent. The filter is copied, so the
+	///  						caller may freely modify or discard it after this call. May be null,
+	///  						in which case the agent uses the shared filters.
+	/// @return The index of the agent in the agent pool. Or -1 if the agent could not be added.
+	int addAgent(const float* pos, const dtCrowdAgentParams* params, const dtQueryFilter* filter);
+
+	/// Sets (or clears) the custom query filter of the specified agent.
+	///  @param[in]		idx		The agent index. [Limits: 0 <= value < #getAgentCount()]
+	///  @param[in]		filter	The custom query filter to copy to the agent, or null to make the
+	///  						agent use the shared filter referenced by
+	///  						#dtCrowdAgentParams::queryFilterType again.
+	void setAgentFilter(const int idx, const dtQueryFilter* filter);
+
+	/// Gets the query filter currently in effect for the specified agent.
+	///  @param[in]		idx		The agent index. [Limits: 0 <= value < #getAgentCount()]
+	/// @return The agent's custom filter if it has one, otherwise the shared filter used by the
+	///  		agent. Null if the index is invalid.
+	const dtQueryFilter* getAgentFilter(const int idx) const;
 
 	/// Updates the specified agent's configuration.
 	///  @param[in]		idx		The agent index. [Limits: 0 <= value < #getAgentCount()]
@@ -414,7 +452,8 @@ distance planning and provide the crowd manager with intermediate targets.
 
 Other significant limitations:
 
-- All agents using the crowd manager will use the same #dtQueryFilter.
+- Agents use the shared #dtQueryFilter selected by #dtCrowdAgentParams::queryFilterType unless a
+  custom per-agent filter is assigned via #dtCrowd::addAgent() or #dtCrowd::setAgentFilter().
 - Crowd management is relatively expensive. The maximum agents under crowd 
   management at any one time is between 20 and 30.  A good place to start
   is a maximum of 25 agents for 0.5ms per frame.

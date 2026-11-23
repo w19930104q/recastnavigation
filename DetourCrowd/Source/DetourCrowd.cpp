@@ -510,6 +510,18 @@ void dtCrowd::updateAgentParameters(const int idx, const dtCrowdAgentParams* par
 /// The agent's position will be constrained to the surface of the navigation mesh.
 int dtCrowd::addAgent(const float* pos, const dtCrowdAgentParams* params)
 {
+	return addAgent(pos, params, 0);
+}
+
+/// @par
+///
+/// The agent's position will be constrained to the surface of the navigation mesh.
+///
+/// If @p filter is non-null, it is copied to the agent and used for all of the agent's
+/// pathfinding (corridor updates, path requests, boundary and validity checks) instead of
+/// the shared filter referenced by #dtCrowdAgentParams::queryFilterType.
+int dtCrowd::addAgent(const float* pos, const dtCrowdAgentParams* params, const dtQueryFilter* filter)
+{
 	// Find empty slot.
 	int idx = -1;
 	for (int i = 0; i < m_maxAgents; ++i)
@@ -522,16 +534,17 @@ int dtCrowd::addAgent(const float* pos, const dtCrowdAgentParams* params)
 	}
 	if (idx == -1)
 		return -1;
-	
-	dtCrowdAgent* ag = &m_agents[idx];		
+
+	dtCrowdAgent* ag = &m_agents[idx];
 
 	updateAgentParameters(idx, params);
-	
+	setAgentFilter(idx, filter);
+
 	// Find nearest position on navmesh and place the agent there.
 	float nearest[3];
 	dtPolyRef ref = 0;
 	dtVcopy(nearest, pos);
-	dtStatus status = m_navquery->findNearestPoly(pos, m_agentPlacementHalfExtents, &m_filters[ag->params.queryFilterType], &ref, nearest);
+	dtStatus status = m_navquery->findNearestPoly(pos, m_agentPlacementHalfExtents, getAgentFilter(ag), &ref, nearest);
 	if (dtStatusFailed(status))
 	{
 		dtVcopy(nearest, pos);
@@ -575,6 +588,35 @@ void dtCrowd::removeAgent(const int idx)
 	{
 		m_agents[idx].active = false;
 	}
+}
+
+/// @par
+///
+/// The filter is copied to the agent, so the caller may freely modify or discard @p filter
+/// after this call. Pass null to make the agent use the shared filter referenced by
+/// #dtCrowdAgentParams::queryFilterType again.
+void dtCrowd::setAgentFilter(const int idx, const dtQueryFilter* filter)
+{
+	if (idx < 0 || idx >= m_maxAgents)
+		return;
+
+	dtCrowdAgent* ag = &m_agents[idx];
+	if (filter)
+	{
+		ag->filter = *filter;
+		ag->hasCustomFilter = true;
+	}
+	else
+	{
+		ag->hasCustomFilter = false;
+	}
+}
+
+const dtQueryFilter* dtCrowd::getAgentFilter(const int idx) const
+{
+	if (idx < 0 || idx >= m_maxAgents)
+		return 0;
+	return getAgentFilter(&m_agents[idx]);
 }
 
 bool dtCrowd::requestMoveTargetReplan(const int idx, dtPolyRef ref, const float* pos)
@@ -704,7 +746,7 @@ void dtCrowd::updateMoveRequest(const float /*dt*/)
 
 			// Quick search towards the goal.
 			static const int MAX_ITER = 20;
-			m_navquery->initSlicedFindPath(path[0], ag->targetRef, ag->npos, ag->targetPos, &m_filters[ag->params.queryFilterType]);
+			m_navquery->initSlicedFindPath(path[0], ag->targetRef, ag->npos, ag->targetPos, getAgentFilter(ag));
 			m_navquery->updateSlicedFindPath(MAX_ITER, 0);
 			dtStatus status = 0;
 			if (ag->targetReplan) // && npath > 10)
@@ -772,7 +814,7 @@ void dtCrowd::updateMoveRequest(const float /*dt*/)
 	{
 		dtCrowdAgent* ag = queue[i];
 		ag->targetPathqRef = m_pathq.request(ag->corridor.getLastPoly(), ag->targetRef,
-											 ag->corridor.getTarget(), ag->targetPos, &m_filters[ag->params.queryFilterType]);
+											 ag->corridor.getTarget(), ag->targetPos, getAgentFilter(ag));
 		if (ag->targetPathqRef != DT_PATHQ_INVALID)
 			ag->targetState = DT_CROWDAGENT_TARGET_WAITING_FOR_PATH;
 	}
@@ -931,7 +973,7 @@ void dtCrowd::updateTopologyOptimization(dtCrowdAgent** agents, const int nagent
 	for (int i = 0; i < nqueue; ++i)
 	{
 		dtCrowdAgent* ag = queue[i];
-		ag->corridor.optimizePathTopology(m_navquery, &m_filters[ag->params.queryFilterType]);
+		ag->corridor.optimizePathTopology(m_navquery, getAgentFilter(ag));
 		ag->topologyOptTime = 0;
 	}
 
@@ -958,14 +1000,14 @@ void dtCrowd::checkPathValidity(dtCrowdAgent** agents, const int nagents, const 
 		float agentPos[3];
 		dtPolyRef agentRef = ag->corridor.getFirstPoly();
 		dtVcopy(agentPos, ag->npos);
-		if (!m_navquery->isValidPolyRef(agentRef, &m_filters[ag->params.queryFilterType]))
+		if (!m_navquery->isValidPolyRef(agentRef, getAgentFilter(ag)))
 		{
 			// Current location is not valid, try to reposition.
 			// TODO: this can snap agents, how to handle that?
 			float nearest[3];
 			dtVcopy(nearest, agentPos);
 			agentRef = 0;
-			m_navquery->findNearestPoly(ag->npos, m_agentPlacementHalfExtents, &m_filters[ag->params.queryFilterType], &agentRef, nearest);
+			m_navquery->findNearestPoly(ag->npos, m_agentPlacementHalfExtents, getAgentFilter(ag), &agentRef, nearest);
 			dtVcopy(agentPos, nearest);
 
 			if (!agentRef)
@@ -995,13 +1037,13 @@ void dtCrowd::checkPathValidity(dtCrowdAgent** agents, const int nagents, const 
 		// Try to recover move request position.
 		if (ag->targetState != DT_CROWDAGENT_TARGET_NONE && ag->targetState != DT_CROWDAGENT_TARGET_FAILED)
 		{
-			if (!m_navquery->isValidPolyRef(ag->targetRef, &m_filters[ag->params.queryFilterType]))
+			if (!m_navquery->isValidPolyRef(ag->targetRef, getAgentFilter(ag)))
 			{
 				// Current target is not valid, try to reposition.
 				float nearest[3];
 				dtVcopy(nearest, ag->targetPos);
 				ag->targetRef = 0;
-				m_navquery->findNearestPoly(ag->targetPos, m_agentPlacementHalfExtents, &m_filters[ag->params.queryFilterType], &ag->targetRef, nearest);
+				m_navquery->findNearestPoly(ag->targetPos, m_agentPlacementHalfExtents, getAgentFilter(ag), &ag->targetRef, nearest);
 				dtVcopy(ag->targetPos, nearest);
 				replan = true;
 			}
@@ -1015,7 +1057,7 @@ void dtCrowd::checkPathValidity(dtCrowdAgent** agents, const int nagents, const 
 		}
 
 		// If nearby corridor is not valid, replan.
-		if (!ag->corridor.isValid(CHECK_LOOKAHEAD, m_navquery, &m_filters[ag->params.queryFilterType]))
+		if (!ag->corridor.isValid(CHECK_LOOKAHEAD, m_navquery, getAgentFilter(ag)))
 		{
 			// Fix current path.
 //			ag->corridor.trimInvalidPath(agentRef, agentPos, m_navquery, &m_filter);
@@ -1082,10 +1124,10 @@ void dtCrowd::update(const float dt, dtCrowdAgentDebugInfo* debug)
 		// if it has become invalid.
 		const float updateThr = ag->params.collisionQueryRange*0.25f;
 		if (dtVdist2DSqr(ag->npos, ag->boundary.getCenter()) > dtSqr(updateThr) ||
-			!ag->boundary.isValid(m_navquery, &m_filters[ag->params.queryFilterType]))
+			!ag->boundary.isValid(m_navquery, getAgentFilter(ag)))
 		{
 			ag->boundary.update(ag->corridor.getFirstPoly(), ag->npos, ag->params.collisionQueryRange,
-								m_navquery, &m_filters[ag->params.queryFilterType]);
+								m_navquery, getAgentFilter(ag));
 		}
 		// Query neighbour agents
 		ag->nneis = getNeighbours(ag->npos, ag->params.height, ag->params.collisionQueryRange,
@@ -1107,14 +1149,14 @@ void dtCrowd::update(const float dt, dtCrowdAgentDebugInfo* debug)
 		
 		// Find corners for steering
 		ag->ncorners = ag->corridor.findCorners(ag->cornerVerts, ag->cornerFlags, ag->cornerPolys,
-												DT_CROWDAGENT_MAX_CORNERS, m_navquery, &m_filters[ag->params.queryFilterType]);
+												DT_CROWDAGENT_MAX_CORNERS, m_navquery, getAgentFilter(ag));
 		
 		// Check to see if the corner after the next corner is directly visible,
 		// and short cut to there.
 		if ((ag->params.updateFlags & DT_CROWD_OPTIMIZE_VIS) && ag->ncorners > 0)
 		{
 			const float* target = &ag->cornerVerts[dtMin(1,ag->ncorners-1)*3];
-			ag->corridor.optimizePathVisibility(target, ag->params.pathOptimizationRange, m_navquery, &m_filters[ag->params.queryFilterType]);
+			ag->corridor.optimizePathVisibility(target, ag->params.pathOptimizationRange, m_navquery, getAgentFilter(ag));
 			
 			// Copy data for debug purposes.
 			if (debugIdx == i)
@@ -1394,7 +1436,7 @@ void dtCrowd::update(const float dt, dtCrowdAgentDebugInfo* debug)
 			continue;
 		
 		// Move along navmesh.
-		ag->corridor.movePosition(ag->npos, m_navquery, &m_filters[ag->params.queryFilterType]);
+		ag->corridor.movePosition(ag->npos, m_navquery, getAgentFilter(ag));
 		// Get valid constrained position back.
 		dtVcopy(ag->npos, ag->corridor.getPos());
 
